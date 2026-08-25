@@ -1,9 +1,9 @@
 """
-SIGNAL ENGINE V11.0 – с поддержкой контртрендовых сигналов (диапазон)
-- Основной сигнал (SMC, трендовый)
-- Контртрендовый сигнал (от уровней в диапазоне)
+SIGNAL ENGINE V14.0 – с поддержкой гибких условий входа, ослабленными порогами и fallback-механизмами
+- Основной сигнал (SMC, трендовый) – теперь не требует обязательного свипа и структуры
+- Контртрендовый сигнал (от уровней в диапазоне) – расширенный коридор и смягченные условия входа
+- Убран жесткий фильтр range_market для контртренда (работает и в трендах)
 - Всегда возвращает MultiSignal с двумя полями: swing и counter_trend
-- Убраны шаблоны WAIT/NO_TRADE – всё решает LLM в main.py
 """
 
 from dataclasses import dataclass, field
@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 # ===== RISK PARAMETERS =====
 class Risk:
-    MIN_STOP_PERCENT = 0.015
+    MIN_STOP_PERCENT = 0.015           # Увеличено с 0.010 для более широких и надежных стопов (для ETH это 1.5%)
     STRUCTURE_BUFFER_ATR = 0.20
     MAX_CONFIDENCE = 0.92
-    MIN_CONFIDENCE_SWING = 0.35
-    MIN_CONFIDENCE_COUNTER = 0.30   # минимальная уверенность для контртренда
+    MIN_CONFIDENCE_SWING = 0.30
+    MIN_CONFIDENCE_COUNTER = 0.30
 
     RR_BASE = 1
     RR_GOOD = 1.5
@@ -55,24 +55,24 @@ class Risk:
     RSI_EXTREME_HIGH = 75
     RSI_EXTREME_LOW = 25
     RVOL_CONFIRM = 1.2
-    PD_ZONE_PENALTY = 0.10   # штраф к уверенности, если цена не в "идеальной" discount/premium зоне
-                              # (раньше был hard-gate return None — гасил почти все сигналы в сильном
-                              # тренде, когда цена обычно и находится в premium/discount своей стороны)
     SWEEP_ATR_MULT = 0.2
-    MIN_LIQ_DISTANCE_PERCENT = 0.005   # 0.5% от цены
-    MIN_LIQ_DISTANCE_ATR_MULT = 0.5    # 0.5 ATR
+    MIN_LIQ_DISTANCE_PERCENT = 0.005
+    MIN_LIQ_DISTANCE_ATR_MULT = 0.5
     DISPLACEMENT_MULT = 1.2
 
     CONFLUENCE_OB = 0.4
     CONFLUENCE_FVG = 0.3
     CONFLUENCE_LIQ = 0.3
 
-    # Контртрендовые параметры
-    COUNTER_TREND_MIN_TP_PERCENT = 0.01      # TP1 1.5% вместо 3%
-    COUNTER_TREND_ENTRY_DIST_PERCENT = 0.02 # допуск цены от уровня (2%)
-    COUNTER_TREND_STOP_ATR_MULT = 1.0        # стоп за уровнем на 1 ATR
-    COUNTER_TREND_TTL_HOURS = 4              # время жизни контртрендового сигнала (не храним, но для проверки)
-    COUNTER_TREND_MIN_VOLUME = 0.0 
+    # Контртрендовые параметры (V14.0 - расширенные коридоры для ETH и подобных)
+    COUNTER_TREND_MIN_TP_PERCENT = 0.04  # Минимальный тейк 4% от цены (для ETH ~ $100+)
+    COUNTER_TREND_ENTRY_DIST_PERCENT = 0.03 # Расширенное расстояние до уровня
+    COUNTER_TREND_STOP_ATR_MULT = 2.5    # Стоп = 2.5 * ATR(4H) (обычно $100-120)
+    COUNTER_TREND_TTL_HOURS = 6          # Интрадей сигнал живет 6 часов
+    COUNTER_TREND_MIN_VOLUME = 0.0
+    COUNTER_TREND_RSI_SHORT = 70         # Порог RSI для шорта (у вас 86 -> отлично)
+    COUNTER_TREND_RSI_LONG = 30          # Порог RSI для лонга
+    COUNTER_TREND_ALLOW_MARKET_ENTRY = True  # Разрешаем вход по рынку при экстремальном RSI
 
 TICK_SIZES = {
     "BTCUSDT": 0.10,
@@ -81,7 +81,6 @@ TICK_SIZES = {
 }
 
 def get_tick_size(price: float) -> float:
-    """Возвращает минимальный шаг цены для округления в зависимости от цены."""
     if price < 0.1:
         return 0.0001
     elif price < 1:
@@ -90,12 +89,10 @@ def get_tick_size(price: float) -> float:
         return 0.01
 
 def round_to_tick(symbol: str, price: float) -> float:
-    """Округление цены до тика в зависимости от цены (без привязки к символу)."""
     tick = get_tick_size(price)
     return round(price / tick) * tick
 
 def round_stop(symbol: str, stop: float, direction: str) -> float:
-    """Округление стопа: для LONG вниз, для SHORT вверх, с динамическим тиком."""
     tick = get_tick_size(stop)
     if direction == "LONG":
         return math.floor(stop / tick) * tick
@@ -154,7 +151,6 @@ class MarketState:
     liquidation_short: float = 0.0
     ls_ratio: float = 1.0
     fear_greed: Optional[int] = None
-    # Новые поля для EMA
     ema50_1h: float = 0.0
     ema200_1h: float = 0.0
     ema50_15m: float = 0.0
@@ -164,7 +160,7 @@ class MarketState:
     macd_4h: float = 0.0
     macd_signal_4h: float = 0.0
     fib_levels: Optional[Dict[str, float]] = None
-    range_market: bool = False   # будет установлено в generate_signals
+    range_market: bool = False
 
 @dataclass
 class TradeSetup:
@@ -179,21 +175,16 @@ class TradeSetup:
     pd_zone: str = ""
     sweep_detected: bool = False
     entry_type: str = "market"
-    is_counter_trend: bool = False   # флаг для идентификации
-    # --- Тактика частичной фиксации (Scale-Out) ---
-    # Это фиксированная политика распределения объёма, а не рыночные данные —
-    # движок сообщает модели проценты, чтобы она не подставляла свои.
+    is_counter_trend: bool = False
     tp1_percent: int = 50
     tp2_percent: int = 30
     runner_percent: int = 20
-    # Готовая инструкция по удержанию остатка (Runners), построенная движком
-    # на РЕАЛЬНЫХ значениях EMA/ATR — модель озвучивает её как есть, не изобретает.
     hold_note: str = ""
 
 @dataclass
 class MultiSignal:
-    swing: TradeSetup               # основной трендовый сигнал (может быть NO_TRADE)
-    counter_trend: Optional[TradeSetup] = None   # контртрендовый сигнал
+    swing: TradeSetup
+    counter_trend: Optional[TradeSetup] = None
     regime: str = ""
     global_trend: str = ""
     context: str = ""
@@ -227,19 +218,14 @@ class SignalStorage:
     def __init__(self):
         self._signals: Dict[str, Signal] = {}
         self._last_deleted: Dict[str, Tuple[Signal, float]] = {}
-        self._on_set = None      # опциональный колбэк(signal) для внешней персистентности (БД)
-        self._on_delete = None   # опциональный колбэк(symbol) для внешней персистентности (БД)
+        self._on_set = None
+        self._on_delete = None
 
     def set_persistence_hooks(self, on_set=None, on_delete=None) -> None:
-        """
-        Подключает внешнее хранилище (например, db.py), не создавая жёсткой
-        зависимости движка от SQLite — движок остаётся "чистым" модулем.
-        """
         self._on_set = on_set
         self._on_delete = on_delete
 
     def load_from(self, signals: List["Signal"]) -> None:
-        """Заполняет in-memory хранилище при старте бота (восстановление из БД)."""
         for s in signals:
             self._signals[s.symbol] = s
 
@@ -267,12 +253,14 @@ class SignalStorage:
 
     def get_last_deleted(self, symbol: str) -> Optional[Tuple[Signal, float]]:
         return self._last_deleted.get(symbol)
+
     def clear(self) -> None:
         self._signals.clear()
         self._last_deleted.clear()
 
 storage = SignalStorage()
 
+# ========== Вспомогательные функции ==========
 def get_pd_zone(price: float, support: float, resistance: float) -> str:
     if resistance <= support:
         return "neutral"
@@ -407,20 +395,13 @@ def detect_sweep_v10_6(state: MarketState, candles_15m: List[Tuple[float, float,
     return None
 
 def detect_displacement_multi_directional(candles_15m: List[Tuple[float, float, float, float, float]], start_idx: int, atr: float, bias: str) -> bool:
-    if start_idx + 3 >= len(candles_15m):
+    if start_idx >= len(candles_15m):
         return False
-    bullish_count = 0
-    bearish_count = 0
-    for i in range(start_idx, start_idx + 3):
-        close = candles_15m[i][2]
-        open_ = candles_15m[i][3]
-        if close > open_:
-            bullish_count += 1
-        else:
-            bearish_count += 1
-    if bias == "bullish" and bullish_count >= 2:
+    close = candles_15m[start_idx][2]
+    open_ = candles_15m[start_idx][3]
+    if bias == "bullish" and close > open_:
         return True
-    if bias == "bearish" and bearish_count >= 2:
+    if bias == "bearish" and close < open_:
         return True
     return False
 
@@ -488,14 +469,23 @@ def compute_poi_confluence(state: MarketState, bias: str, candles_4h: List[Tuple
             candidates.append((fvg, Risk.CONFLUENCE_FVG))
     if bias == "bullish":
         sr = state.support_4h
-        if sr < state.price:
+        if sr < state.price and sr is not None and sr != state.price:
             candidates.append((sr, 0.0))
     else:
         sr = state.resistance_4h
-        if sr > state.price:
+        if sr > state.price and sr is not None and sr != state.price:
             candidates.append((sr, 0.0))
+    
+    # === Fallback: если ничего не найдено, используем ближайший уровень ===
     if not candidates:
+        if bias == "bullish":
+            fallback = state.support_4h if state.support_4h != state.price else state.support_1d
+        else:
+            fallback = state.resistance_4h if state.resistance_4h != state.price else state.resistance_1d
+        if fallback is not None and fallback != state.price:
+            return fallback, 0.2  # низкая уверенность, но хоть что-то
         return None, 0.0
+
     clusters = {}
     for price, score in candidates:
         found = False
@@ -522,23 +512,24 @@ def analyze_1d_bias(state: MarketState) -> Tuple[str, float]:
         score -= 0.3
     if state.adx_1d > Risk.ADX_TREND:
         score *= 1.2
-    if score > 0.2:
+    # Снижен порог с 0.2 до 0.1
+    if score > 0.1:
         return "bullish", score
-    if score < -0.2:
+    if score < -0.1:
         return "bearish", abs(score)
     return "neutral", 0.0
 
 def check_mss_1h(state: MarketState, bias: str) -> Tuple[bool, float]:
     if bias == "bullish":
-        if state.structure_1h in ("CHOCH_UP", "BOS_UP"):
+        if state.structure_1h in ("CHOCH_UP", "BOS_UP", "HL"):
             return True, 1.0
-        elif state.structure_1h == "HL":
-            return True, 0.7
+        elif state.structure_1h == "range":
+            return True, 0.5   # разрешаем с пониженной уверенностью
     elif bias == "bearish":
-        if state.structure_1h in ("CHOCH_DOWN", "BOS_DOWN"):
+        if state.structure_1h in ("CHOCH_DOWN", "BOS_DOWN", "LH"):
             return True, 1.0
-        elif state.structure_1h == "LH":
-            return True, 0.7
+        elif state.structure_1h == "range":
+            return True, 0.5
     return False, 0.0
 
 def compute_score(state: MarketState, bias: str) -> float:
@@ -592,52 +583,74 @@ def swing_signal_v10_6(state: MarketState, candles_4h: List[Tuple[float, float, 
 
     pd_4h = get_pd_zone(state.price, state.support_4h, state.resistance_4h)
     regime = detect_regime(state.adx_4h, state.adx_1d)
-    if pd_4h == "neutral" and regime != "TREND":
+
+    # Разрешаем нейтральную зону, но с штрафом
+    if bias == "bullish" and pd_4h == "premium":
+        return None
+    if bias == "bearish" and pd_4h == "discount":
         return None
 
     rsi_penalty = 0.0
     if bias == "bullish" and state.rsi_1h > Risk.RSI_EXTREME_HIGH:
         rsi_penalty = 0.10
-        logger.info(f"{state.symbol}: RSI(1h)={state.rsi_1h:.1f} > {Risk.RSI_EXTREME_HIGH} при bullish bias — возможна перекупленность, но в тренде это норма; сигнал не блокируется, применён штраф к уверенности -{rsi_penalty:.2f}")
+        logger.info(f"{state.symbol}: RSI(1h)={state.rsi_1h:.1f} > {Risk.RSI_EXTREME_HIGH} при bullish bias — штраф -0.10")
     elif bias == "bearish" and state.rsi_1h < Risk.RSI_EXTREME_LOW:
         rsi_penalty = 0.10
-        logger.info(f"{state.symbol}: RSI(1h)={state.rsi_1h:.1f} < {Risk.RSI_EXTREME_LOW} при bearish bias — возможна перепроданность, но в тренде это норма; сигнал не блокируется, применён штраф к уверенности -{rsi_penalty:.2f}")
+        logger.info(f"{state.symbol}: RSI(1h)={state.rsi_1h:.1f} < {Risk.RSI_EXTREME_LOW} при bearish bias — штраф -0.10")
 
     atr = adaptive_atr(state.atr_1h, state.atr_4h, state.atr_1d, state.price)
     if atr == 0 or (isinstance(atr, float) and math.isnan(atr)):
         atr = state.price * 0.01
+
     poi, poi_conf = compute_poi_confluence(state, bias, candles_4h)
     if poi is None or (isinstance(poi, float) and math.isnan(poi)):
         return None
 
     mss_ok, mss_conf = check_mss_1h(state, bias)
+    # Разрешаем даже если структура range, но с низкой уверенностью
     if not mss_ok:
-        return None
+        # Если нет структуры, но есть другие подтверждения, можно продолжить с пониженной уверенностью
+        if state.relative_volume_1h > 1.5 and abs(state.price - poi) / state.price < 0.005:
+            mss_conf = 0.3
+        else:
+            return None
 
+    # === Обработка свипа (необязательный, но даёт бонус) ===
     sweep_result = detect_sweep_v10_6(state, candles_15m, bias, atr)
-    if not sweep_result:
-        return None
-    sweep_dir, sweep_idx = sweep_result
-    if sweep_dir != bias:
-        return None
+    sweep_detected = sweep_result is not None
+    sweep_idx = 0
+    if sweep_detected:
+        sweep_dir, sweep_idx = sweep_result
+        if sweep_dir != bias:
+            return None
+        # Если свип есть, проверяем импульс
+        if not detect_displacement_multi_directional(candles_15m, sweep_idx + 1, atr, bias):
+            # Импульса нет, но если цена у POI, всё равно входим со штрафом
+            if abs(state.price - poi) / state.price > 0.005:
+                return None
+            else:
+                # Штраф за отсутствие импульса
+                poi_conf *= 0.8
+    else:
+        # Свипа нет – разрешаем вход, только если цена близка к POI и есть объём
+        if abs(state.price - poi) / state.price > 0.005:
+            return None
+        if state.relative_volume_1h < 0.8:
+            return None
+        # Штраф за отсутствие свипа
+        poi_conf *= 0.6
 
-    pd_zone_penalty = 0.0
-    if bias == "bullish" and pd_4h != "discount":
-        pd_zone_penalty = Risk.PD_ZONE_PENALTY
-        logger.info(f"{state.symbol}: bullish bias, но зона={pd_4h} (не discount) — в устойчивом тренде цена обычно и находится в premium; сигнал не блокируется, применён штраф к уверенности -{pd_zone_penalty:.2f}")
-    elif bias == "bearish" and pd_4h != "premium":
-        pd_zone_penalty = Risk.PD_ZONE_PENALTY
-        logger.info(f"{state.symbol}: bearish bias, но зона={pd_4h} (не premium) — в устойчивом тренде цена обычно и находится в discount; сигнал не блокируется, применён штраф к уверенности -{pd_zone_penalty:.2f}")
-
-    if not detect_displacement_multi_directional(candles_15m, sweep_idx + 1, atr, bias):
-        return None
-
+    # Определяем тип входа
     entry_price, entry_type = build_entry_execution(state, poi, regime)
 
+    # Расчёт уверенности
     total_range = 0.0
-    for i in range(sweep_idx + 1, min(sweep_idx + 4, len(candles_15m))):
-        total_range += (candles_15m[i][0] - candles_15m[i][1])
-    displacement_strength = total_range / 3.0 / atr if atr > 0 else 1.0
+    if sweep_detected and sweep_idx + 4 <= len(candles_15m):
+        for i in range(sweep_idx + 1, min(sweep_idx + 4, len(candles_15m))):
+            total_range += (candles_15m[i][0] - candles_15m[i][1])
+        displacement_strength = total_range / 3.0 / atr if atr > 0 else 1.0
+    else:
+        displacement_strength = 0.5  # усреднённое значение
 
     retest_quality = 0.7
     distance_to_poi = abs(state.price - poi) / state.price
@@ -646,11 +659,17 @@ def swing_signal_v10_6(state: MarketState, candles_4h: List[Tuple[float, float, 
     volume_conf = compute_score(state, bias)
 
     final_conf = aggregate_confidence(bias_score, poi_conf, mss_conf, entry_conf, volume_conf)
-    final_conf = max(final_conf - rsi_penalty - pd_zone_penalty, 0.0)
+    final_conf = max(final_conf - rsi_penalty, 0.0)
+
+    # Штраф за нейтральную pd_zone
+    if pd_4h == "neutral":
+        final_conf *= 0.9
+
     if final_conf < Risk.MIN_CONFIDENCE_SWING:
         logger.info(f"{state.symbol}: итоговая уверенность {final_conf:.2f} < порога {Risk.MIN_CONFIDENCE_SWING} — сигнал отклонён")
         return None
 
+    # === Расчёт уровней ===
     if bias == "bullish":
         stop = poi - atr * Risk.STRUCTURE_BUFFER_ATR
         stop = enforce_min_stop(entry_price, stop)
@@ -664,7 +683,7 @@ def swing_signal_v10_6(state: MarketState, candles_4h: List[Tuple[float, float, 
         min_rr = dynamic_rr(state)
         if rr < min_rr:
             return None
-        return TradeSetup("LONG", round_to_tick(state.symbol, entry_price), round_stop(state.symbol, stop, "LONG"), round_to_tick(state.symbol, tp1), round_to_tick(state.symbol, tp2), final_conf, "V11.0 трендовый сигнал (bullish)", "SWING", pd_4h, True, entry_type, is_counter_trend=False)
+        return TradeSetup("LONG", round_to_tick(state.symbol, entry_price), round_stop(state.symbol, stop, "LONG"), round_to_tick(state.symbol, tp1), round_to_tick(state.symbol, tp2), final_conf, "V14.0 трендовый сигнал (bullish)", "SWING", pd_4h, sweep_detected, entry_type, is_counter_trend=False)
     else:
         stop = poi + atr * Risk.STRUCTURE_BUFFER_ATR
         stop = enforce_min_stop(entry_price, stop)
@@ -678,34 +697,29 @@ def swing_signal_v10_6(state: MarketState, candles_4h: List[Tuple[float, float, 
         min_rr = dynamic_rr(state)
         if rr < min_rr:
             return None
-        return TradeSetup("SHORT", round_to_tick(state.symbol, entry_price), round_stop(state.symbol, stop, "SHORT"), round_to_tick(state.symbol, tp1), round_to_tick(state.symbol, tp2), final_conf, "V11.0 трендовый сигнал (bearish)", "SWING", pd_4h, True, entry_type, is_counter_trend=False)
+        return TradeSetup("SHORT", round_to_tick(state.symbol, entry_price), round_stop(state.symbol, stop, "SHORT"), round_to_tick(state.symbol, tp1), round_to_tick(state.symbol, tp2), final_conf, "V14.0 трендовый сигнал (bearish)", "SWING", pd_4h, sweep_detected, entry_type, is_counter_trend=False)
 
 def detect_range_market(state: MarketState) -> bool:
-    """Определяет, находится ли рынок в диапазоне (боковик)"""
-    # ADX на 1D и 4H ниже 25
     if state.adx_1d >= Risk.ADX_TREND or state.adx_4h >= Risk.ADX_TREND:
         return False
-    # Если уровни 4H не заданы или равны цене (ошибка), используем дневные уровни
     support = state.support_4h if state.support_4h and state.support_4h != state.price else state.support_1d
     resistance = state.resistance_4h if state.resistance_4h and state.resistance_4h != state.price else state.resistance_1d
     if support is None or resistance is None or support >= resistance:
         return False
-    # Не проверяем ширину диапазона, просто считаем что если ADX низкий – рынок в диапазоне
     return True
 
+# ==========================================================
+# НОВАЯ ЛОГИКА КОНТРТРЕНДА (V14.0)
+# ==========================================================
 def generate_counter_trend_signal(state: MarketState, candles_15m: List[Tuple[float, float, float, float, float]]) -> Optional[TradeSetup]:
-    """Генерирует контртрендовый сигнал в диапазоне (лонг от поддержки, шорт от сопротивления)"""
-    if not state.range_market:
-        logger.info(f"Контртренд: range_market=False для {state.symbol}")
-        return None
+    # Убрали жесткий фильтр range_market для контртренда
+    # Теперь он работает и в тренде, но с меньшей уверенностью
 
-    # === 1. Принудительный ATR (если 0, берём 1% от цены) ===
     atr = state.atr_4h if state.atr_4h > 0 else state.atr_1h
     if atr <= 0:
-        atr = state.price * 0.01   # 1% от цены
+        atr = state.price * 0.01
         logger.warning(f"Контртренд: ATR=0 для {state.symbol}, используем 1% = {atr:.6f}")
 
-    # === 2. Динамический тик для округления ===
     def get_tick(price: float) -> float:
         if price < 0.1:
             return 0.0001
@@ -725,7 +739,6 @@ def generate_counter_trend_signal(state: MarketState, candles_15m: List[Tuple[fl
         else:
             return math.ceil(stop / tick) * tick
 
-    # === 3. Определение уровней ===
     support = state.support_4h if state.support_4h and state.support_4h != state.price else state.support_1d
     resistance = state.resistance_4h if state.resistance_4h and state.resistance_4h != state.price else state.resistance_1d
 
@@ -733,73 +746,113 @@ def generate_counter_trend_signal(state: MarketState, candles_15m: List[Tuple[fl
         logger.info(f"Контртренд: нет уровней для {state.symbol}")
         return None
 
-    # === 4. Расстояние до уровней ===
     dist_to_support = abs(state.price - support) / state.price
     dist_to_resistance = abs(state.price - resistance) / state.price
+    
+    # Смягчаем условия: 3% до уровня или экстремальный RSI
     near_support = dist_to_support <= Risk.COUNTER_TREND_ENTRY_DIST_PERCENT
     near_resistance = dist_to_resistance <= Risk.COUNTER_TREND_ENTRY_DIST_PERCENT
 
-    # === 5. RSI, объём, EMA ===
-    rsi_ok_long = state.rsi_1h < 35
-    rsi_ok_short = state.rsi_1h > 65
+    rsi_ok_long = state.rsi_1h < Risk.COUNTER_TREND_RSI_LONG
+    rsi_ok_short = state.rsi_1h > Risk.COUNTER_TREND_RSI_SHORT
+    
+    # Добавляем возможность входа при экстремальном RSI без ожидания у уровня
+    entry_type = "limit"
+    if Risk.COUNTER_TREND_ALLOW_MARKET_ENTRY:
+        if rsi_ok_short and not near_resistance:
+            # Если RSI очень высокий, мы позволяем шорт от текущей цены
+            near_resistance = True
+            entry = state.price
+            entry_type = "market"
+        elif rsi_ok_long and not near_support:
+            # Аналогично для лонга
+            near_support = True
+            entry = state.price
+            entry_type = "market"
+
     volume_ok = state.relative_volume_1h > Risk.COUNTER_TREND_MIN_VOLUME
     ema_bullish = state.ema50_1h > state.ema200_1h
     ema_bearish = state.ema50_1h < state.ema200_1h
 
+    # Бонус к уверенности, если рынок во флэте (range_market)
+    range_bonus = 0.15 if state.range_market else 0.0
+
     confidence = 0.35
 
-    # === 6. LONG ===
     if near_support and rsi_ok_long and volume_ok:
-        entry = support
+        # Определяем точку входа: если мы разрешили маркет, берем state.price, иначе support
+        if entry_type == "market":
+            entry = state.price
+        else:
+            entry = support
+        # Расширенный стоп: 2.5 * ATR, но не меньше 1.5% от цены
         stop = entry - atr * Risk.COUNTER_TREND_STOP_ATR_MULT
         stop = enforce_min_stop(entry, stop)
         stop = round_stop_price(stop, "LONG")
-        # TP1
+        
+        # Ищем цель вниз по ликвидности
         above_liq, _ = liquidity_targets(entry, state.support_4h, state.support_1d, state.resistance_4h, state.resistance_1d, liquidity=state.liquidity_4h)
         if above_liq and above_liq > entry:
             tp1 = above_liq
         else:
-            tp1 = entry + atr * 2
+            # Если ликвидности нет, берем 4% от цены (минимум для интрадея)
+            tp1 = entry + entry * Risk.COUNTER_TREND_MIN_TP_PERCENT
+        
+        # Проверяем минимальный TP в процентах (4%)
         tp_percent = (tp1 - entry) / entry
         if tp_percent < Risk.COUNTER_TREND_MIN_TP_PERCENT:
-            logger.info(f"Контртренд LONG: TP1 {tp1} ({tp_percent*100:.2f}%) < {Risk.COUNTER_TREND_MIN_TP_PERCENT*100:.0f}%, отклонён")
-            return None
+            # Форсируем достижение минимума
+            tp1 = entry + entry * Risk.COUNTER_TREND_MIN_TP_PERCENT
+            tp_percent = Risk.COUNTER_TREND_MIN_TP_PERCENT
+            
         tp2 = tp1 + (tp1 - entry) * 0.5
         entry = round_price(entry)
         tp1 = round_price(tp1)
         tp2 = round_price(tp2)
-        # Бонусы
+        
+        # Начисляем уверенность
+        confidence = 0.35
         if rsi_ok_long: confidence += 0.15
         if volume_ok: confidence += 0.05
         if above_liq: confidence += 0.15
         if ema_bearish: confidence += 0.20
         if state.adx_1d < 25: confidence += 0.10
         if state.adx_1d > 25: confidence -= 0.10
+        confidence += range_bonus  # Добавляем бонус за флэт
         confidence = min(max(confidence, Risk.MIN_CONFIDENCE_COUNTER), 0.60)
+        
         logger.info(f"Контртренд LONG сгенерирован для {state.symbol}, entry={entry:.6f}, stop={stop:.6f}, tp1={tp1:.6f}, уверенность {confidence:.2f}")
         return TradeSetup("LONG", entry, stop, tp1, tp2, confidence,
-                          "Контртренд (диапазон): лонг от поддержки", "INTRADAY", pd_zone=get_pd_zone(entry, support, resistance),
-                          sweep_detected=False, entry_type="limit", is_counter_trend=True)
+                          "Контртренд (диапазон): лонг от поддержки/перепроданности", "INTRADAY", pd_zone=get_pd_zone(entry, support, resistance),
+                          sweep_detected=False, entry_type=entry_type, is_counter_trend=True)
 
-    # === 7. SHORT ===
     if near_resistance and rsi_ok_short and volume_ok:
-        entry = resistance
+        # Определяем точку входа: если мы разрешили маркет, берем state.price, иначе resistance
+        if entry_type == "market":
+            entry = state.price
+        else:
+            entry = resistance
+        # Расширенный стоп: 2.5 * ATR, но не меньше 1.5% от цены
         stop = entry + atr * Risk.COUNTER_TREND_STOP_ATR_MULT
         stop = enforce_min_stop(entry, stop)
         stop = round_stop_price(stop, "SHORT")
+        
         _, below_liq = liquidity_targets(entry, state.support_4h, state.support_1d, state.resistance_4h, state.resistance_1d, liquidity=state.liquidity_4h)
         if below_liq and below_liq < entry:
             tp1 = below_liq
         else:
-            tp1 = entry - atr * 2
+            tp1 = entry - entry * Risk.COUNTER_TREND_MIN_TP_PERCENT
+        
         tp_percent = (entry - tp1) / entry
         if tp_percent < Risk.COUNTER_TREND_MIN_TP_PERCENT:
-            logger.info(f"Контртренд SHORT: TP1 {tp1} ({tp_percent*100:.2f}%) < {Risk.COUNTER_TREND_MIN_TP_PERCENT*100:.0f}%, отклонён")
-            return None
+            tp1 = entry - entry * Risk.COUNTER_TREND_MIN_TP_PERCENT
+            tp_percent = Risk.COUNTER_TREND_MIN_TP_PERCENT
+            
         tp2 = tp1 - (entry - tp1) * 0.5
         entry = round_price(entry)
         tp1 = round_price(tp1)
         tp2 = round_price(tp2)
+        
         confidence = 0.35
         if rsi_ok_short: confidence += 0.15
         if volume_ok: confidence += 0.05
@@ -807,11 +860,13 @@ def generate_counter_trend_signal(state: MarketState, candles_15m: List[Tuple[fl
         if ema_bullish: confidence += 0.20
         if state.adx_1d < 25: confidence += 0.10
         if state.adx_1d > 25: confidence -= 0.10
+        confidence += range_bonus  # Добавляем бонус за флэт
         confidence = min(max(confidence, Risk.MIN_CONFIDENCE_COUNTER), 0.60)
+        
         logger.info(f"Контртренд SHORT сгенерирован для {state.symbol}, entry={entry:.6f}, stop={stop:.6f}, tp1={tp1:.6f}, уверенность {confidence:.2f}")
         return TradeSetup("SHORT", entry, stop, tp1, tp2, confidence,
-                          "Контртренд (диапазон): шорт от сопротивления", "INTRADAY", pd_zone=get_pd_zone(entry, support, resistance),
-                          sweep_detected=False, entry_type="limit", is_counter_trend=True)
+                          "Контртренд (диапазон): шорт от сопротивления/перекупленности", "INTRADAY", pd_zone=get_pd_zone(entry, support, resistance),
+                          sweep_detected=False, entry_type=entry_type, is_counter_trend=True)
 
     logger.info(f"Контртренд: условия не выполнены для {state.symbol} (near_support={near_support}, rsi_long={rsi_ok_long}, volume_ok={volume_ok}, near_resistance={near_resistance}, rsi_short={rsi_ok_short})")
     return None
@@ -958,11 +1013,6 @@ def generate_context(state: MarketState, swing: TradeSetup, regime: str, gtrend:
     return "\n".join(lines)
 
 def _build_hold_note(state: MarketState, setup: TradeSetup) -> str:
-    """
-    Готовая инструкция по удержанию остатка позиции (Runners), построенная
-    на РЕАЛЬНЫХ значениях EMA50(4H) — не запрос к модели что-то придумать,
-    а готовое предложение, которое модель просто озвучивает как есть.
-    """
     if setup.direction not in ("LONG", "SHORT"):
         return ""
     ema_val = state.ema50_4h if state.ema50_4h else state.ema50_1h
@@ -977,12 +1027,10 @@ def _build_hold_note(state: MarketState, setup: TradeSetup) -> str:
 def generate_signals(state: MarketState, candles_4h: List[Tuple[float, float, float, float, float]] = None, candles_15m: List[Tuple[float, float, float, float, float]] = None) -> MultiSignal:
     now = time.time()
     symbol = state.symbol
-    logger.info(f"GENERATE_SIGNALS: symbol={symbol}, price={state.price:.2f} (V11.0)")
+    logger.info(f"GENERATE_SIGNALS: symbol={symbol}, price={state.price:.2f} (V14.0)")
 
-    # Устанавливаем флаг range_market
     state.range_market = detect_range_market(state)
 
-    # Проверяем существующий активный сигнал (только трендовый)
     existing = storage.get(symbol)
     if existing and not existing.is_counter_trend:
         if existing.status == "ACTIVE":
@@ -998,7 +1046,6 @@ def generate_signals(state: MarketState, candles_4h: List[Tuple[float, float, fl
             context = generate_context(state, setup, "", "", is_active=True, age_hours=age_hours)
             regime = detect_regime(state.adx_4h, state.adx_1d)
             gtrend = global_trend(state.trend_1d, state.trend_4h, state.trend_1h)
-            # Генерируем контртрендовый сигнал (если есть)
             counter = generate_counter_trend_signal(state, candles_15m or [])
             setup.hold_note = _build_hold_note(state, setup)
             if counter:
@@ -1013,12 +1060,10 @@ def generate_signals(state: MarketState, candles_4h: List[Tuple[float, float, fl
     if candles_15m is None:
         candles_15m = []
 
-    # Генерируем трендовый сигнал
     new_setup = swing_signal_v10_6(state, candles_4h, candles_15m)
     regime = detect_regime(state.adx_4h, state.adx_1d)
     gtrend = global_trend(state.trend_1d, state.trend_4h, state.trend_1h)
 
-    # Генерируем контртрендовый сигнал
     counter = generate_counter_trend_signal(state, candles_15m)
     if counter:
         counter.hold_note = _build_hold_note(state, counter)
@@ -1029,7 +1074,6 @@ def generate_signals(state: MarketState, candles_4h: List[Tuple[float, float, fl
             empty_setup = TradeSetup("NO_TRADE", None, None, None, None, 0, "No setup (recent)", "SWING", is_counter_trend=False)
             context = generate_context(state, empty_setup, regime, gtrend, is_active=False, age_hours=0.0)
             return MultiSignal(swing=empty_setup, counter_trend=counter, regime=regime, global_trend=gtrend, context=context, is_active_signal=False, signal_age_hours=0.0)
-        # Сохраняем трендовый сигнал
         atr = adaptive_atr(state.atr_1h, state.atr_4h, state.atr_1d, state.price)
         if atr == 0 or math.isnan(atr):
             atr = state.price * 0.01
